@@ -1,0 +1,303 @@
+---
+# =============================================================================
+# Ansible Playbook: System Health Checks
+# Checks: Disk Usage, CPU Usage, Memory Usage, Network Usage
+# =============================================================================
+
+- name: System Health Checks
+  hosts: all
+  gather_facts: true
+  vars:
+    # Thresholds (in percent)
+    disk_usage_threshold: 80
+    cpu_usage_threshold: 85
+    memory_usage_threshold: 80
+    # Network thresholds (in MB/s)
+    network_rx_threshold_mbps: 100
+    network_tx_threshold_mbps: 100
+    # Report output directory (on the control node)
+    report_dir: "./health_reports"
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # DISK USAGE
+    # -------------------------------------------------------------------------
+    - name: Get disk usage for all mounted filesystems
+      ansible.builtin.shell: |
+        df -h --output=source,fstype,size,used,avail,pcent,target \
+          | grep -vE '^Filesystem|tmpfs|devtmpfs|overlay|udev|none'
+      register: disk_raw
+      changed_when: false
+
+    - name: Parse disk usage percentage per mount
+      ansible.builtin.shell: |
+        df -P | awk 'NR>1 && $1 !~ /^(tmpfs|devtmpfs|overlay|udev|none)/ {
+          gsub(/%/, "", $5);
+          print $6 ":" $5
+        }'
+      register: disk_parsed
+      changed_when: false
+
+    - name: Identify mounts exceeding disk threshold
+      ansible.builtin.set_fact:
+        disk_alerts: >-
+          {{
+            disk_parsed.stdout_lines
+            | map('split', ':')
+            | selectattr(1, 'defined')
+            | select('match', '.*')
+            | map('list')
+            | selectattr(1, 'greaterthan', disk_usage_threshold | string)
+            | list
+          }}
+      vars:
+        # Build list of [mount, usage_int] and filter above threshold
+        disk_alerts: >-
+          {{
+            disk_parsed.stdout_lines
+            | map('split', ':')
+            | map('list')
+            | select('ne', [''])
+            | selectattr(1, 'defined')
+            | list
+            | selectattr(1, 'match', '^[0-9]+$')
+            | list
+          }}
+      ignore_errors: true
+
+    - name: Alert — disk usage above threshold
+      ansible.builtin.debug:
+        msg: >
+          ⚠️  HIGH DISK USAGE on {{ inventory_hostname }}:
+          Mount '{{ item.split(':')[0] }}' is at {{ item.split(':')[1] }}%
+          (threshold: {{ disk_usage_threshold }}%)
+      loop: "{{ disk_parsed.stdout_lines }}"
+      when: >
+        item.split(':') | length == 2 and
+        item.split(':')[1] | int > disk_usage_threshold
+
+    - name: Display full disk usage table
+      ansible.builtin.debug:
+        msg: "{{ disk_raw.stdout_lines }}"
+
+    # -------------------------------------------------------------------------
+    # CPU USAGE
+    # -------------------------------------------------------------------------
+    - name: Get CPU usage (1-second sample)
+      ansible.builtin.shell: |
+        top -bn1 | grep "Cpu(s)" | \
+          awk '{print 100 - $8}' | \
+          awk '{printf "%.1f", $1}'
+      register: cpu_usage_raw
+      changed_when: false
+
+    - name: Set CPU usage fact
+      ansible.builtin.set_fact:
+        cpu_usage: "{{ cpu_usage_raw.stdout | float }}"
+
+    - name: Display CPU usage
+      ansible.builtin.debug:
+        msg: "ℹ️  CPU usage on {{ inventory_hostname }}: {{ cpu_usage }}%"
+
+    - name: Alert — CPU usage above threshold
+      ansible.builtin.debug:
+        msg: >
+          ⚠️  HIGH CPU USAGE on {{ inventory_hostname }}:
+          {{ cpu_usage }}% (threshold: {{ cpu_usage_threshold }}%)
+      when: cpu_usage | float > cpu_usage_threshold
+
+    - name: Get top 5 CPU-consuming processes
+      ansible.builtin.shell: |
+        ps -eo pid,ppid,cmd,%cpu --sort=-%cpu | head -6
+      register: top_cpu_procs
+      changed_when: false
+      when: cpu_usage | float > cpu_usage_threshold
+
+    - name: Display top CPU processes (only when threshold breached)
+      ansible.builtin.debug:
+        msg: "{{ top_cpu_procs.stdout_lines }}"
+      when:
+        - cpu_usage | float > cpu_usage_threshold
+        - top_cpu_procs is defined
+
+    # -------------------------------------------------------------------------
+    # MEMORY USAGE
+    # -------------------------------------------------------------------------
+    - name: Get memory usage
+      ansible.builtin.shell: |
+        free -m | awk '/^Mem:/ {
+          total=$2; used=$3; free=$4; shared=$5; cache=$6; avail=$7;
+          pct=int((used/total)*100);
+          printf "total=%dMB used=%dMB free=%dMB available=%dMB usage_pct=%d", total, used, free, avail, pct
+        }'
+      register: mem_raw
+      changed_when: false
+
+    - name: Parse memory usage percentage
+      ansible.builtin.shell: |
+        free -m | awk '/^Mem:/ {printf "%.1f", ($3/$2)*100}'
+      register: mem_pct_raw
+      changed_when: false
+
+    - name: Set memory usage fact
+      ansible.builtin.set_fact:
+        memory_usage: "{{ mem_pct_raw.stdout | float }}"
+
+    - name: Display memory usage
+      ansible.builtin.debug:
+        msg: "ℹ️  Memory on {{ inventory_hostname }}: {{ mem_raw.stdout }}"
+
+    - name: Alert — memory usage above threshold
+      ansible.builtin.debug:
+        msg: >
+          ⚠️  HIGH MEMORY USAGE on {{ inventory_hostname }}:
+          {{ memory_usage }}% (threshold: {{ memory_usage_threshold }}%)
+      when: memory_usage | float > memory_usage_threshold
+
+    - name: Get top 5 memory-consuming processes
+      ansible.builtin.shell: |
+        ps -eo pid,ppid,cmd,%mem --sort=-%mem | head -6
+      register: top_mem_procs
+      changed_when: false
+      when: memory_usage | float > memory_usage_threshold
+
+    - name: Display top memory processes (only when threshold breached)
+      ansible.builtin.debug:
+        msg: "{{ top_mem_procs.stdout_lines }}"
+      when:
+        - memory_usage | float > memory_usage_threshold
+        - top_mem_procs is defined
+
+    # -------------------------------------------------------------------------
+    # NETWORK USAGE
+    # -------------------------------------------------------------------------
+    - name: Get active network interfaces
+      ansible.builtin.shell: |
+        ip -o link show | awk -F': ' '$3 !~ /LOOPBACK/ {print $2}' | cut -d'@' -f1
+      register: net_interfaces
+      changed_when: false
+
+    - name: Sample network RX/TX over 2 seconds
+      ansible.builtin.shell: |
+        IFACE="{{ item }}"
+        RX1=$(cat /sys/class/net/${IFACE}/statistics/rx_bytes 2>/dev/null || echo 0)
+        TX1=$(cat /sys/class/net/${IFACE}/statistics/tx_bytes 2>/dev/null || echo 0)
+        sleep 2
+        RX2=$(cat /sys/class/net/${IFACE}/statistics/rx_bytes 2>/dev/null || echo 0)
+        TX2=$(cat /sys/class/net/${IFACE}/statistics/tx_bytes 2>/dev/null || echo 0)
+        RX_RATE=$(( (RX2 - RX1) / 2 / 1024 / 1024 ))
+        TX_RATE=$(( (TX2 - TX1) / 2 / 1024 / 1024 ))
+        echo "iface=${IFACE} rx_mbps=${RX_RATE} tx_mbps=${TX_RATE}"
+      register: net_stats
+      loop: "{{ net_interfaces.stdout_lines }}"
+      changed_when: false
+      when: net_interfaces.stdout_lines | length > 0
+
+    - name: Display network usage per interface
+      ansible.builtin.debug:
+        msg: "ℹ️  Network on {{ inventory_hostname }}: {{ item.stdout }}"
+      loop: "{{ net_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - net_stats is defined
+        - item.stdout is defined
+
+    - name: Alert — high RX network usage
+      ansible.builtin.debug:
+        msg: >
+          ⚠️  HIGH NETWORK RX on {{ inventory_hostname }}
+          interface {{ item.stdout | regex_search('iface=(\S+)', '\1') | first }}:
+          {{ item.stdout | regex_search('rx_mbps=(\d+)', '\1') | first }} MB/s
+          (threshold: {{ network_rx_threshold_mbps }} MB/s)
+      loop: "{{ net_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - net_stats is defined
+        - item.stdout is defined
+        - (item.stdout | regex_search('rx_mbps=(\d+)', '\1') | first | int) > network_rx_threshold_mbps
+
+    - name: Alert — high TX network usage
+      ansible.builtin.debug:
+        msg: >
+          ⚠️  HIGH NETWORK TX on {{ inventory_hostname }}
+          interface {{ item.stdout | regex_search('iface=(\S+)', '\1') | first }}:
+          {{ item.stdout | regex_search('tx_mbps=(\d+)', '\1') | first }} MB/s
+          (threshold: {{ network_tx_threshold_mbps }} MB/s)
+      loop: "{{ net_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - net_stats is defined
+        - item.stdout is defined
+        - (item.stdout | regex_search('tx_mbps=(\d+)', '\1') | first | int) > network_tx_threshold_mbps
+
+    # -------------------------------------------------------------------------
+    # SYSTEM UPTIME & LOAD AVERAGE
+    # -------------------------------------------------------------------------
+    - name: Get system uptime and load average
+      ansible.builtin.shell: uptime
+      register: uptime_raw
+      changed_when: false
+
+    - name: Display uptime and load average
+      ansible.builtin.debug:
+        msg: "ℹ️  Uptime on {{ inventory_hostname }}: {{ uptime_raw.stdout }}"
+
+    # -------------------------------------------------------------------------
+    # SUMMARY REPORT (saved to control node)
+    # -------------------------------------------------------------------------
+    - name: Ensure report directory exists on control node
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      run_once: false
+
+    - name: Write health report to control node
+      ansible.builtin.copy:
+        dest: "{{ report_dir }}/{{ inventory_hostname }}_health_{{ ansible_date_time.date }}.txt"
+        content: |
+          ============================================================
+          HEALTH CHECK REPORT — {{ inventory_hostname }}
+          Date : {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+          OS   : {{ ansible_distribution }} {{ ansible_distribution_version }}
+          ============================================================
+
+          [ DISK USAGE ]
+          {{ disk_raw.stdout }}
+
+          [ CPU USAGE ]
+          Current usage : {{ cpu_usage }}%
+          Threshold     : {{ cpu_usage_threshold }}%
+          Status        : {% if cpu_usage | float > cpu_usage_threshold %}⚠️  ALERT{% else %}✅ OK{% endif %}
+
+          [ MEMORY USAGE ]
+          {{ mem_raw.stdout }}
+          Usage %   : {{ memory_usage }}%
+          Threshold : {{ memory_usage_threshold }}%
+          Status    : {% if memory_usage | float > memory_usage_threshold %}⚠️  ALERT{% else %}✅ OK{% endif %}
+
+          [ NETWORK INTERFACES ]
+          {% for result in net_stats.results %}
+          {% if result.stdout is defined %}
+          {{ result.stdout }}
+          {% endif %}
+          {% endfor %}
+
+          [ UPTIME / LOAD ]
+          {{ uptime_raw.stdout }}
+
+          ============================================================
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: Health check complete
+      ansible.builtin.debug:
+        msg: >
+          ✅ Health check finished for {{ inventory_hostname }}.
+          Report saved to {{ report_dir }}/{{ inventory_hostname }}_health_{{ ansible_date_time.date }}.txt
+

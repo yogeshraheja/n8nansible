@@ -1,0 +1,476 @@
+---
+# =============================================================================
+# Ansible Playbook: System Health Checks (Cross-Platform)
+# Supports: Linux (Debian/RHEL/Arch) and BSD/macOS
+# All awk is POSIX-only — no gawk extensions
+# =============================================================================
+
+- name: System Health Checks
+  hosts: all
+  gather_facts: true
+  vars:
+    disk_usage_threshold: 80        # percent
+    cpu_usage_threshold: 85         # percent
+    memory_usage_threshold: 80      # percent
+    network_rx_threshold_mbps: 100  # MB/s
+    network_tx_threshold_mbps: 100  # MB/s
+    report_dir: "./health_reports"
+
+  tasks:
+
+    # -------------------------------------------------------------------------
+    # OS DETECTION
+    # -------------------------------------------------------------------------
+    - name: Detect OS family
+      ansible.builtin.set_fact:
+        is_linux: "{{ ansible_system == 'Linux' }}"
+        is_bsd:   "{{ ansible_system in ['FreeBSD', 'OpenBSD', 'NetBSD'] }}"
+        is_macos: "{{ ansible_system == 'Darwin' }}"
+
+    # -------------------------------------------------------------------------
+    # DISK USAGE  — df -Pkl is POSIX, works on Linux, macOS, BSD
+    # -------------------------------------------------------------------------
+    - name: Get disk usage (POSIX-compatible)
+      ansible.builtin.shell: |
+        df -Pkl | awk 'NR>1 && $1 !~ /^(devfs|map |tmpfs|devtmpfs|overlay|udev|none)/ {
+          gsub(/%/, "", $5)
+          printf "%-30s %8s %8s %8s %4s%%  %s\n", $1, $2"K", $3"K", $4"K", $5, $6
+        }'
+      register: disk_raw
+      changed_when: false
+
+    - name: Parse disk usage percent per mount
+      ansible.builtin.shell: |
+        df -Pkl | awk 'NR>1 && $1 !~ /^(devfs|map |tmpfs|devtmpfs|overlay|udev|none)/ {
+          gsub(/%/, "", $5)
+          print $6 ":" $5
+        }'
+      register: disk_parsed
+      changed_when: false
+
+    - name: Display disk usage table
+      ansible.builtin.debug:
+        msg: "{{ ['Source                           Size      Used      Avail  Use%  Mount'] + disk_raw.stdout_lines }}"
+
+    - name: Alert — disk usage above threshold
+      ansible.builtin.debug:
+        msg: >-
+          ⚠️  HIGH DISK USAGE on {{ inventory_hostname }}:
+          mount '{{ item.split(':')[0] }}' is at {{ item.split(':')[1] }}%
+          (threshold: {{ disk_usage_threshold }}%)
+      loop: "{{ disk_parsed.stdout_lines }}"
+      when:
+        - item.split(':') | length == 2
+        - item.split(':')[1] | int > disk_usage_threshold
+
+    # -------------------------------------------------------------------------
+    # CPU USAGE
+    # -------------------------------------------------------------------------
+
+    ## Linux — diff two /proc/stat reads 1 second apart (no awk extensions needed)
+    - name: Get CPU usage — Linux
+      ansible.builtin.shell: |
+        LINE1=$(head -1 /proc/stat)
+        sleep 1
+        LINE2=$(head -1 /proc/stat)
+        echo "$LINE1" > /tmp/_cpu1
+        echo "$LINE2" > /tmp/_cpu2
+        awk '{
+          if (NR==1) { for(i=2;i<=NF;i++) t1+=$i; i1=$5+$6 }
+          if (NR==2) { for(i=2;i<=NF;i++) t2+=$i; i2=$5+$6 }
+        } END {
+          dt=t2-t1; di=i2-i1
+          printf "%.1f", (dt-di)/dt*100
+        }' /tmp/_cpu1 /tmp/_cpu2
+      register: cpu_raw_linux
+      changed_when: false
+      when: is_linux
+
+    ## macOS — top -l2 -n0 produces two snapshots; grab idle% from last CPU line
+    ## Use sub() instead of 3-arg match() to stay POSIX
+    - name: Get CPU usage — macOS
+      ansible.builtin.shell: |
+        top -l2 -n0 2>/dev/null | awk '
+          /^CPU usage/ {
+            line = $0
+            sub(/.*idle,? */, "", line)   # remove everything up to idle,
+            # $0 now looks like "4.16% user, 8.33% sys, 87.50% idle"
+            # reset and re-parse original line
+            line = $0
+          }
+          /^CPU usage/ {
+            n = split($0, parts, ",")
+            for (i=1; i<=n; i++) {
+              if (parts[i] ~ /idle/) {
+                sub(/[^0-9.]*/,"",parts[i])
+                sub(/%.*/, "",parts[i])
+                idle = parts[i]+0
+              }
+            }
+            last_idle = idle
+          }
+          END { printf "%.1f", 100 - last_idle }
+        '
+      register: cpu_raw_macos
+      changed_when: false
+      when: is_macos
+
+    ## BSD — read sysctl kern.cp_time twice
+    - name: Get CPU usage — BSD
+      ansible.builtin.shell: |
+        S1=$(sysctl -n kern.cp_time)
+        sleep 1
+        S2=$(sysctl -n kern.cp_time)
+        # kern.cp_time: user nice sys intr idle
+        awk -v s1="$S1" -v s2="$S2" 'BEGIN {
+          n=split(s1,a," "); split(s2,b," ")
+          t1=0; t2=0
+          for(i=1;i<=n;i++){t1+=a[i]; t2+=b[i]}
+          dt=t2-t1
+          idle_delta=b[n]-a[n]
+          printf "%.1f", (dt-idle_delta)/dt*100
+        }'
+      register: cpu_raw_bsd
+      changed_when: false
+      when: is_bsd
+
+    - name: Set CPU usage fact
+      ansible.builtin.set_fact:
+        cpu_usage: >-
+          {{
+            (cpu_raw_linux.stdout  if is_linux else
+             cpu_raw_macos.stdout  if is_macos else
+             cpu_raw_bsd.stdout)   | float
+          }}
+
+    - name: Display CPU usage
+      ansible.builtin.debug:
+        msg: "ℹ️  CPU usage on {{ inventory_hostname }}: {{ cpu_usage }}%"
+
+    - name: Alert — CPU usage above threshold
+      ansible.builtin.debug:
+        msg: >-
+          ⚠️  HIGH CPU USAGE on {{ inventory_hostname }}:
+          {{ cpu_usage }}% (threshold: {{ cpu_usage_threshold }}%)
+      when: cpu_usage | float > cpu_usage_threshold
+
+    ## ps -axo + POSIX sort works on Linux, macOS, BSD
+    - name: Get top 5 CPU-consuming processes
+      ansible.builtin.shell: |
+        ps -axo pid,ppid,%cpu,comm | sort -t' ' -k3 -rn | head -6
+      register: top_cpu_procs
+      changed_when: false
+      when: cpu_usage | float > cpu_usage_threshold
+
+    - name: Display top CPU processes
+      ansible.builtin.debug:
+        msg: "{{ top_cpu_procs.stdout_lines }}"
+      when:
+        - cpu_usage | float > cpu_usage_threshold
+        - top_cpu_procs.stdout_lines is defined
+
+    # -------------------------------------------------------------------------
+    # MEMORY USAGE
+    # -------------------------------------------------------------------------
+
+    ## Linux — free -m (only available on Linux)
+    - name: Get memory usage — Linux
+      ansible.builtin.shell: |
+        free -m | awk '/^Mem:/ {
+          printf "total=%dMB used=%dMB free=%dMB available=%dMB pct=%.1f",
+            $2, $3, $4, $7, ($3/$2)*100
+        }'
+      register: mem_raw_linux
+      changed_when: false
+      when: is_linux
+
+    - name: Get memory usage percent — Linux
+      ansible.builtin.shell: |
+        free -m | awk '/^Mem:/ { printf "%.1f", ($3/$2)*100 }'
+      register: mem_pct_linux
+      changed_when: false
+      when: is_linux
+
+    ## macOS — vm_stat page counts + sysctl for total RAM
+    ## Avoid 3-arg match(); use simple field splits instead
+    - name: Get memory usage — macOS
+      ansible.builtin.shell: |
+        page_size=$(sysctl -n hw.pagesize)
+        total_bytes=$(sysctl -n hw.memsize)
+        vm_stat | awk -v ps="$page_size" -v total="$total_bytes" '
+          /Pages active:/     { gsub(/\./,"",$3); active=$3+0 }
+          /Pages wired down:/ { gsub(/\./,"",$4); wired=$4+0  }
+          /Pages speculative:/{ gsub(/\./,"",$3); spec=$3+0   }
+          /Pages occupied by compressor:/ { gsub(/\./,"",$5); compr=$5+0 }
+          END {
+            used_bytes = (active + wired + spec + compr) * ps
+            free_bytes = total - used_bytes
+            pct = used_bytes / total * 100
+            printf "total=%.0fMB used=%.0fMB free=%.0fMB pct=%.1f",
+              total/1048576, used_bytes/1048576, free_bytes/1048576, pct
+          }
+        '
+      register: mem_raw_macos
+      changed_when: false
+      when: is_macos
+
+    - name: Get memory usage percent — macOS
+      ansible.builtin.shell: |
+        page_size=$(sysctl -n hw.pagesize)
+        total_bytes=$(sysctl -n hw.memsize)
+        vm_stat | awk -v ps="$page_size" -v total="$total_bytes" '
+          /Pages active:/     { gsub(/\./,"",$3); active=$3+0 }
+          /Pages wired down:/ { gsub(/\./,"",$4); wired=$4+0  }
+          /Pages speculative:/{ gsub(/\./,"",$3); spec=$3+0   }
+          /Pages occupied by compressor:/ { gsub(/\./,"",$5); compr=$5+0 }
+          END {
+            used=(active+wired+spec+compr)*ps
+            printf "%.1f", used/total*100
+          }
+        '
+      register: mem_pct_macos
+      changed_when: false
+      when: is_macos
+
+    ## BSD — sysctl hw.physmem + vm.stats
+    - name: Get memory usage — BSD
+      ansible.builtin.shell: |
+        total=$(sysctl -n hw.physmem)
+        free=$(sysctl -n vm.stats.vm.v_free_count)
+        pagesize=$(sysctl -n hw.pagesize)
+        awk -v total="$total" -v free="$free" -v ps="$pagesize" 'BEGIN {
+          free_bytes = free * ps
+          used_bytes = total - free_bytes
+          printf "total=%.0fMB used=%.0fMB free=%.0fMB pct=%.1f",
+            total/1048576, used_bytes/1048576, free_bytes/1048576, used_bytes/total*100
+        }'
+      register: mem_raw_bsd
+      changed_when: false
+      when: is_bsd
+
+    - name: Get memory usage percent — BSD
+      ansible.builtin.shell: |
+        total=$(sysctl -n hw.physmem)
+        free=$(sysctl -n vm.stats.vm.v_free_count)
+        pagesize=$(sysctl -n hw.pagesize)
+        awk -v total="$total" -v free="$free" -v ps="$pagesize" 'BEGIN {
+          free_bytes=free*ps; used=total-free_bytes
+          printf "%.1f", used/total*100
+        }'
+      register: mem_pct_bsd
+      changed_when: false
+      when: is_bsd
+
+    - name: Set memory usage facts
+      ansible.builtin.set_fact:
+        memory_summary: >-
+          {{
+            mem_raw_linux.stdout  if is_linux else
+            mem_raw_macos.stdout  if is_macos else
+            mem_raw_bsd.stdout
+          }}
+        memory_usage: >-
+          {{
+            (mem_pct_linux.stdout  if is_linux else
+             mem_pct_macos.stdout  if is_macos else
+             mem_pct_bsd.stdout)   | float
+          }}
+
+    - name: Display memory usage
+      ansible.builtin.debug:
+        msg: "ℹ️  Memory on {{ inventory_hostname }}: {{ memory_summary }}"
+
+    - name: Alert — memory usage above threshold
+      ansible.builtin.debug:
+        msg: >-
+          ⚠️  HIGH MEMORY USAGE on {{ inventory_hostname }}:
+          {{ memory_usage }}% (threshold: {{ memory_usage_threshold }}%)
+      when: memory_usage | float > memory_usage_threshold
+
+    - name: Get top 5 memory-consuming processes
+      ansible.builtin.shell: |
+        ps -axo pid,ppid,%mem,comm | sort -t' ' -k3 -rn | head -6
+      register: top_mem_procs
+      changed_when: false
+      when: memory_usage | float > memory_usage_threshold
+
+    - name: Display top memory processes
+      ansible.builtin.debug:
+        msg: "{{ top_mem_procs.stdout_lines }}"
+      when:
+        - memory_usage | float > memory_usage_threshold
+        - top_mem_procs.stdout_lines is defined
+
+    # -------------------------------------------------------------------------
+    # NETWORK USAGE
+    # -------------------------------------------------------------------------
+
+    ## Linux — /sys/class/net byte counters
+    - name: Get network interfaces — Linux
+      ansible.builtin.shell: |
+        ls /sys/class/net/ | grep -vE '^lo$'
+      register: net_ifaces_linux
+      changed_when: false
+      when: is_linux
+
+    - name: Sample network RX/TX — Linux
+      ansible.builtin.shell: |
+        IFACE="{{ item }}"
+        BASE=/sys/class/net/${IFACE}/statistics
+        RX1=$(cat ${BASE}/rx_bytes 2>/dev/null || echo 0)
+        TX1=$(cat ${BASE}/tx_bytes 2>/dev/null || echo 0)
+        sleep 2
+        RX2=$(cat ${BASE}/rx_bytes 2>/dev/null || echo 0)
+        TX2=$(cat ${BASE}/tx_bytes 2>/dev/null || echo 0)
+        RX=$(( (RX2 - RX1) / 2 / 1048576 ))
+        TX=$(( (TX2 - TX1) / 2 / 1048576 ))
+        echo "iface=${IFACE} rx_mbps=${RX} tx_mbps=${TX}"
+      loop: "{{ net_ifaces_linux.stdout_lines | default([]) }}"
+      register: net_stats_linux
+      changed_when: false
+      when: is_linux
+
+    ## macOS/BSD — netstat -ib; diff cumulative counters across 2s
+    ## Avoid paste (not always available); use temp files instead
+    - name: Sample network RX/TX — macOS/BSD
+      ansible.builtin.shell: |
+        netstat -ib | awk 'NR>1 && $1 !~ /^lo/ && /[0-9]/ {print $1, $7, $10}' \
+          | sort -u -k1,1 > /tmp/_net1
+        sleep 2
+        netstat -ib | awk 'NR>1 && $1 !~ /^lo/ && /[0-9]/ {print $1, $7, $10}' \
+          | sort -u -k1,1 > /tmp/_net2
+        awk '
+          NR==FNR { rx1[$1]=$2; tx1[$1]=$3; next }
+          ($1 in rx1) {
+            rx = ($2 - rx1[$1]) / 2 / 1048576
+            tx = ($3 - tx1[$1]) / 2 / 1048576
+            printf "iface=%s rx_mbps=%.0f tx_mbps=%.0f\n", $1, rx, tx
+          }
+        ' /tmp/_net1 /tmp/_net2
+      register: net_stats_macos
+      changed_when: false
+      when: is_macos or is_bsd
+
+    - name: Set unified network stats fact
+      ansible.builtin.set_fact:
+        net_lines: >-
+          {{
+            (net_stats_linux.results | map(attribute='stdout') | list)
+            if is_linux else
+            net_stats_macos.stdout_lines
+          }}
+
+    - name: Display network usage per interface
+      ansible.builtin.debug:
+        msg: "ℹ️  Network {{ inventory_hostname }}: {{ item }}"
+      loop: "{{ net_lines }}"
+      when: item | length > 0
+
+    ## Extract rx/tx values with shell so no Ansible filter extensions are needed
+    - name: Parse RX/TX values from network stats
+      ansible.builtin.shell: |
+        echo "{{ item }}" | awk '{
+          for(i=1;i<=NF;i++){
+            if($i ~ /^rx_mbps=/) { sub(/rx_mbps=/,"",$i); rx=$i }
+            if($i ~ /^tx_mbps=/) { sub(/tx_mbps=/,"",$i); tx=$i }
+          }
+          print rx ":" tx
+        }'
+      loop: "{{ net_lines }}"
+      register: net_parsed
+      changed_when: false
+      when: item | length > 0
+
+    - name: Alert — high RX network usage
+      ansible.builtin.debug:
+        msg: >-
+          ⚠️  HIGH NETWORK RX on {{ inventory_hostname }}: {{ net_lines[idx] }}
+          exceeds RX threshold of {{ network_rx_threshold_mbps }} MB/s
+      loop: "{{ net_parsed.results }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.item | default('') }}"
+      when:
+        - item.stdout is defined
+        - item.stdout.split(':')[0] | int > network_rx_threshold_mbps
+
+    - name: Alert — high TX network usage
+      ansible.builtin.debug:
+        msg: >-
+          ⚠️  HIGH NETWORK TX on {{ inventory_hostname }}: {{ net_lines[idx] }}
+          exceeds TX threshold of {{ network_tx_threshold_mbps }} MB/s
+      loop: "{{ net_parsed.results }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.item | default('') }}"
+      when:
+        - item.stdout is defined
+        - item.stdout.split(':')[1] | int > network_tx_threshold_mbps
+
+    # -------------------------------------------------------------------------
+    # UPTIME / LOAD AVERAGE  — uptime is POSIX
+    # -------------------------------------------------------------------------
+    - name: Get uptime and load average
+      ansible.builtin.shell: uptime
+      register: uptime_raw
+      changed_when: false
+
+    - name: Display uptime
+      ansible.builtin.debug:
+        msg: "ℹ️  Uptime on {{ inventory_hostname }}: {{ uptime_raw.stdout }}"
+
+    # -------------------------------------------------------------------------
+    # SUMMARY REPORT (written to control node)
+    # -------------------------------------------------------------------------
+    - name: Ensure report directory exists on control node
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+
+    - name: Write health report
+      ansible.builtin.copy:
+        dest: "{{ report_dir }}/{{ inventory_hostname }}_health_{{ ansible_date_time.date }}.txt"
+        mode: "0644"
+        content: |
+          ============================================================
+          HEALTH CHECK REPORT — {{ inventory_hostname }}
+          Date   : {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+          OS     : {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Kernel : {{ ansible_kernel }}
+          ============================================================
+
+          [ DISK USAGE ]
+          Source                           Size      Used      Avail  Use%  Mount
+          {{ disk_raw.stdout }}
+
+          [ CPU USAGE ]
+          Usage     : {{ cpu_usage }}%
+          Threshold : {{ cpu_usage_threshold }}%
+          Status    : {% if cpu_usage | float > cpu_usage_threshold %}⚠️  ALERT{% else %}✅ OK{% endif %}
+
+
+          [ MEMORY USAGE ]
+          {{ memory_summary }}
+          Usage     : {{ memory_usage }}%
+          Threshold : {{ memory_usage_threshold }}%
+          Status    : {% if memory_usage | float > memory_usage_threshold %}⚠️  ALERT{% else %}✅ OK{% endif %}
+
+
+          [ NETWORK (2-second sample, MB/s) ]
+          {% for line in net_lines %}
+          {{ line }}
+          {% endfor %}
+
+          [ UPTIME / LOAD ]
+          {{ uptime_raw.stdout }}
+
+          ============================================================
+      delegate_to: localhost
+
+    - name: Health check complete
+      ansible.builtin.debug:
+        msg: >-
+          ✅ Health check done for {{ inventory_hostname }}.
+          Report → {{ report_dir }}/{{ inventory_hostname }}_health_{{ ansible_date_time.date }}.txt
